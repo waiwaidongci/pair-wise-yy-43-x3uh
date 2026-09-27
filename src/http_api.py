@@ -89,6 +89,11 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/tasks"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"tasks": service.list_tasks(item_id, role)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -113,6 +118,23 @@ def make_handler(service: Service, static_dir: str):
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/tasks"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.create_task(item_id, body, actor, role))
+                elif (path.startswith("/api/items/") and "/tasks/" in path
+                        and path.endswith("/status")):
+                    parts = path.split("/")
+                    item_id = int(parts[3])
+                    task_id = int(parts[5])
+                    self._json(200, service.update_task_status(
+                        item_id, task_id, body, actor, role))
+                elif (path.startswith("/api/items/") and "/records/" in path
+                        and path.endswith("/status")):
+                    parts = path.split("/")
+                    item_id = int(parts[3])
+                    record_id = int(parts[5])
+                    self._json(200, service.update_record_status(
+                        item_id, record_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")

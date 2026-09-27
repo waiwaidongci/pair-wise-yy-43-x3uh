@@ -29,10 +29,14 @@ python3 app.py --db ./data.db --port 8320
 - `POST /api/items`
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
+- `POST /api/items/{id}/records/{record_id}/status`，打开或关闭记录（如岸线监测记录）
+- `GET /api/items/{id}/tasks`
+- `POST /api/items/{id}/tasks`，登记处置任务：类别（containment/recovery/shoreline_protection/waste_disposal）、责任单位、截止时间（ISO8601）、可选外部编号
+- `POST /api/items/{id}/tasks/{task_id}/status`，任务完成情况（open/done）
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
 - `GET /api/audit`
 
-允许角色：observer, response_commander, operations, viewer。估算油量、海况和未完成任务数影响响应等级；关闭前必须完成回收和岸线监测记录。
+允许角色：observer, response_commander, operations, viewer。估算油量、海况和未完成任务数影响响应等级；超过截止时间仍未完成的任务会提高事件优先级并计入列表的`overdue_tasks`。事件关闭前必须完成全部回收任务、关闭全部岸线监测记录（kind为`shoreline_monitoring`）且没有未关闭事项。同一事件内任务和记录的外部编号重复上报会被拒绝，任务与记录的状态变化都会记入审计链。
 
 ## 测试
 

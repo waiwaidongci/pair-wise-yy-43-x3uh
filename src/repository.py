@@ -4,11 +4,12 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import (ID_PREFIX, RECOVERY_CATEGORY, SHORELINE_MONITORING_KIND,
+                    STATES, TASK_CATEGORIES, TASK_STATUSES)
 
 
 class Repository:
@@ -24,6 +25,8 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        categories = ",".join("'" + c.replace("'", "''") + "'" for c in TASK_CATEGORIES)
+        task_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in TASK_STATUSES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -52,6 +55,22 @@ class Repository:
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    category TEXT NOT NULL CHECK(category IN ({categories})),
+                    responsible_unit TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '',
+                    deadline TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ({task_statuses})),
+                    external_ref TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
                     UNIQUE(item_id, external_ref)
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -156,6 +175,104 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def update_record_status(self, item_id: int, record_id: int,
+                             status: str) -> Tuple[Dict[str, Any], str]:
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM records WHERE id=? AND item_id=?",
+                (record_id, item_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("记录不存在")
+            if row["status"] == status:
+                raise ConflictError("记录已处于该状态")
+            self.conn.execute("UPDATE records SET status=? WHERE id=?",
+                              (status, record_id))
+            previous = row["status"]
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM records WHERE id=?",
+                                    (record_id,)).fetchone()
+        return dict(row), previous
+
+    def create_task(self, item_id: int, category: str, responsible_unit: str,
+                    detail: str, deadline: str, external_ref: Optional[str],
+                    actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO tasks(item_id, category, responsible_unit, detail,
+                       deadline, status, external_ref, created_by, created_at, updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (item_id, category, responsible_unit, detail, deadline, "open",
+                     external_ref, actor, now, now),
+                )
+                task_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("任务外部编号已存在") from exc
+        return self.get_task(item_id, task_id)
+
+    def get_task(self, item_id: int, task_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM tasks WHERE id=? AND item_id=?",
+                (task_id, item_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("任务不存在")
+        return dict(row)
+
+    def list_tasks(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM tasks WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_task_status(self, item_id: int, task_id: int,
+                           status: str) -> Tuple[Dict[str, Any], str]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM tasks WHERE id=? AND item_id=?",
+                (task_id, item_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("任务不存在")
+            if row["status"] == status:
+                raise ConflictError("任务已处于该状态")
+            completed_at = now if status == "done" else None
+            self.conn.execute(
+                "UPDATE tasks SET status=?, completed_at=?, updated_at=? WHERE id=?",
+                (status, completed_at, now, task_id),
+            )
+            previous = row["status"]
+        return self.get_task(item_id, task_id), previous
+
+    def item_counts(self, item_id: int) -> Dict[str, int]:
+        now = utc_now()
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT
+                     (SELECT COUNT(*) FROM records
+                       WHERE item_id=? AND status='open') AS open_records,
+                     (SELECT COUNT(*) FROM tasks
+                       WHERE item_id=? AND status<>'done') AS open_tasks,
+                     (SELECT COUNT(*) FROM tasks
+                       WHERE item_id=? AND status<>'done' AND deadline<?) AS overdue_tasks,
+                     (SELECT COUNT(*) FROM tasks
+                       WHERE item_id=? AND category=? AND status<>'done')
+                         AS incomplete_recovery_tasks,
+                     (SELECT COUNT(*) FROM records
+                       WHERE item_id=? AND kind=? AND status='open')
+                         AS open_shoreline_records""",
+                (item_id, item_id, item_id, now, item_id, RECOVERY_CATEGORY,
+                 item_id, SHORELINE_MONITORING_KIND),
+            ).fetchone()
+        return dict(row)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
