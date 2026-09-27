@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 class ErrorKind:
     VALIDATION="validation"; NOT_FOUND="not_found"; FORBIDDEN="forbidden"; CONFLICT="conflict"
@@ -18,6 +19,9 @@ class Item:
 class Record:
     id:int; item_id:int; kind:str; detail:str; status:str; external_ref:Optional[str]; created_by:str; created_at:str
 @dataclass(frozen=True)
+class Task:
+    id:int; item_id:int; category:str; responsible_unit:str; due_at:str; status:str; external_ref:Optional[str]; created_by:str; created_at:str; updated_at:str
+@dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
 def require_text(value,field,max_length=2000):
@@ -34,5 +38,13 @@ def require_number(value,field,minimum=0.0):
     except (TypeError,ValueError): raise ValidationError(f"{field}必须是数字")
     if number<minimum: raise ValidationError(f"{field}不能小于{minimum}")
     return number
+def require_datetime(value,field):
+    if not isinstance(value,str) or not value.strip(): raise ValidationError(f"{field}不能为空")
+    text=value.strip()
+    if text.endswith("Z"): text=text[:-1]+"+00:00"
+    try: parsed=datetime.fromisoformat(text)
+    except ValueError: raise ValidationError(f"{field}必须是ISO 8601格式时间")
+    if parsed.tzinfo is None: parsed=parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 def ensure_role(role,allowed):
     if role not in allowed: raise PermissionDenied("当前角色无权执行该操作")

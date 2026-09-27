@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import (ID_PREFIX, SHORELINE_RECORD_KIND, STATES, TASK_CATEGORIES,
+                    TASK_STATUSES)
 
 
 class Repository:
@@ -24,6 +25,8 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        categories = ",".join("'" + c.replace("'", "''") + "'" for c in TASK_CATEGORIES)
+        task_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in TASK_STATUSES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -52,6 +55,20 @@ class Repository:
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    category TEXT NOT NULL CHECK(category IN ({categories})),
+                    responsible_unit TEXT NOT NULL,
+                    due_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ({task_statuses})),
+                    external_ref TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -154,6 +171,79 @@ class Repository:
             row = self.conn.execute(
                 "SELECT COUNT(*) AS n FROM records WHERE item_id=? AND status='open'",
                 (item_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    def open_shoreline_record_count(self, item_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM records WHERE item_id=? AND status='open' AND kind=?",
+                (item_id, SHORELINE_RECORD_KIND),
+            ).fetchone()
+        return int(row["n"])
+
+    def add_task(self, item_id: int, category: str, responsible_unit: str,
+                 due_at: str, status: str, external_ref: Optional[str],
+                 actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO tasks(item_id, category, responsible_unit, due_at,
+                       status, external_ref, created_by, created_at, updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (item_id, category, responsible_unit, due_at, status,
+                     external_ref, actor, now, now),
+                )
+                task_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("任务外部编号已存在") from exc
+        return self.get_task(task_id)
+
+    def get_task(self, task_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("任务不存在")
+        return dict(row)
+
+    def list_tasks(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM tasks WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_task_status(self, item_id: int, task_id: int,
+                           status: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE tasks SET status=?, updated_at=? WHERE id=? AND item_id=?",
+                (status, now, task_id, item_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError("任务不存在")
+        return self.get_task(task_id)
+
+    def open_task_count(self, item_id: int, category: Optional[str] = None) -> int:
+        sql = "SELECT COUNT(*) AS n FROM tasks WHERE item_id=? AND status!='completed'"
+        params: list = [item_id]
+        if category:
+            sql += " AND category=?"
+            params.append(category)
+        with self._lock:
+            row = self.conn.execute(sql, params).fetchone()
+        return int(row["n"])
+
+    def overdue_task_count(self, item_id: int, now_iso: str) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COUNT(*) AS n FROM tasks
+                   WHERE item_id=? AND status!='completed' AND due_at<?""",
+                (item_id, now_iso),
             ).fetchone()
         return int(row["n"])
 

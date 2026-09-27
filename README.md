@@ -25,14 +25,25 @@ python3 app.py --db ./data.db --port 8320
 ## 主要接口
 
 - `GET /health`
-- `GET /api/items`
+- `GET /api/items`，支持`?overdue=true`只列出含逾期任务的事件
 - `POST /api/items`
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `GET /api/items/{id}/tasks`
+- `POST /api/items/{id}/tasks`
+- `POST /api/items/{id}/tasks/{task_id}/status`
 - `GET /api/audit`
 
 允许角色：observer, response_commander, operations, viewer。估算油量、海况和未完成任务数影响响应等级；关闭前必须完成回收和岸线监测记录。
+
+## 处置任务
+
+每个事件可挂围控（containment）、回收（recovery）、岸线保护（shoreline_protection）、废弃物处置（waste_disposal）四类任务，记录责任单位、截止时间（ISO 8601）和状态（open → in_progress → completed）。任务创建和状态变化都写入审计链。
+
+- 事件和任务的`external_ref`均唯一，同一外部编号重复上报会被拒绝（409）。
+- 超过截止时间仍未完成的任务会提高事件优先级，并在列表中以`overdue_tasks`/`has_overdue_tasks`标出。
+- 事件关闭前置条件：回收任务全部完成、岸线监测记录（kind为`shoreline_monitoring`）全部关闭，且无其他未关闭事项；不满足时返回具体阻塞原因。
 
 ## 测试
 

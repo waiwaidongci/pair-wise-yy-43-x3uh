@@ -83,12 +83,19 @@ def make_handler(service: Service, static_dir: str):
                 elif path == "/api/items":
                     actor, role = self._identity()
                     del actor
-                    self._json(200, {"items": service.list_items(role)})
+                    query = parse_qs(urlparse(self.path).query)
+                    overdue_only = query.get("overdue", [""])[0].lower() in ("1", "true", "yes")
+                    self._json(200, {"items": service.list_items(role, overdue_only=overdue_only)})
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/tasks"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"tasks": service.list_tasks(item_id, role)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -113,6 +120,15 @@ def make_handler(service: Service, static_dir: str):
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/tasks"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.add_task(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and "/tasks/" in path and path.endswith("/status"):
+                    parts = path.split("/")
+                    item_id = int(parts[3])
+                    task_id = int(parts[5])
+                    self._json(200, service.update_task_status(
+                        item_id, task_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")

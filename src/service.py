@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .audit import utc_now
+from .domain import (NotFoundError, ValidationError, ensure_role,
+                     normalize_severity, require_datetime, require_number,
+                     require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES,
+                    RECOVERY_CATEGORY, TASK_CATEGORIES, TASK_ROLES,
+                    TASK_STATUSES, TITLE, VIEW_ROLES, completion_blockers,
+                    escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
+                    validate_task_transition, validate_transition)
 
 
 class Service:
@@ -63,7 +68,11 @@ class Service:
         ensure_role(role, role_for_transition(target))
         if not isinstance(expected_version, int) or expected_version < 1:
             raise ValueError("expected_version必须是正整数")
-        blockers = completion_blockers(target, self.repository.open_record_count(item_id))
+        blockers = completion_blockers(
+            target,
+            self.repository.open_record_count(item_id),
+            self.repository.open_task_count(item_id, RECOVERY_CATEGORY),
+            self.repository.open_shoreline_record_count(item_id))
         if blockers:
             from .domain import ConflictError
             raise ConflictError("；".join(blockers))
@@ -75,13 +84,69 @@ class Service:
         })
         return self.enrich(updated)
 
+    def add_task(self, item_id: int, payload: Dict[str, Any], actor: str,
+                 role: str) -> Dict[str, Any]:
+        ensure_role(role, TASK_ROLES)
+        actor = require_text(actor, "actor", 100)
+        category = payload.get("category")
+        if category not in TASK_CATEGORIES:
+            raise ValidationError("category不在允许范围内")
+        responsible_unit = require_text(payload.get("responsible_unit"),
+                                        "responsible_unit", 200)
+        due_at = require_datetime(payload.get("due_at"), "due_at")
+        status = payload.get("status", "open")
+        if status not in TASK_STATUSES:
+            raise ValidationError("status不在允许范围内")
+        external_ref = payload.get("external_ref")
+        if external_ref is not None:
+            external_ref = require_text(external_ref, "external_ref", 100)
+        task = self.repository.add_task(item_id, category, responsible_unit,
+                                        due_at, status, external_ref, actor)
+        self.repository.append_audit("task_create", ENTITY, item_id, actor, {
+            "task_id": task["id"], "category": category,
+            "responsible_unit": responsible_unit, "due_at": due_at,
+            "status": status,
+        })
+        return task
+
+    def update_task_status(self, item_id: int, task_id: int,
+                           payload: Dict[str, Any], actor: str,
+                           role: str) -> Dict[str, Any]:
+        ensure_role(role, TASK_ROLES)
+        actor = require_text(actor, "actor", 100)
+        target = payload.get("status")
+        if target not in TASK_STATUSES:
+            raise ValidationError("status不在允许范围内")
+        task = self.repository.get_task(task_id)
+        if task["item_id"] != item_id:
+            raise NotFoundError("任务不存在")
+        validate_task_transition(task["status"], target)
+        updated = self.repository.update_task_status(item_id, task_id, target)
+        self.repository.append_audit("task_status", ENTITY, item_id, actor, {
+            "task_id": task_id, "category": task["category"],
+            "from": task["status"], "to": target,
+        })
+        return updated
+
+    def list_tasks(self, item_id: int, role: str) -> list:
+        self._view(role)
+        now = utc_now()
+        tasks = self.repository.list_tasks(item_id)
+        for task in tasks:
+            task["overdue"] = task["status"] != "completed" and task["due_at"] < now
+        return tasks
+
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
         return self.enrich(self.repository.get_item(item_id))
 
-    def list_items(self, role: str, status: Optional[str] = None) -> list:
+    def list_items(self, role: str, status: Optional[str] = None,
+                   overdue_only: bool = False) -> list:
         self._view(role)
-        return [self.enrich(item) for item in self.repository.list_items(status)]
+        items = [self.enrich(item) for item in self.repository.list_items(status)]
+        if overdue_only:
+            items = [item for item in items if item["has_overdue_tasks"]]
+        return items
 
     def list_records(self, item_id: int, role: str) -> list:
         self._view(role)
@@ -91,13 +156,20 @@ class Service:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
 
-    @staticmethod
-    def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
+    def enrich(self, item: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(item)
+        open_records = self.repository.open_record_count(item["id"])
+        open_tasks = self.repository.open_task_count(item["id"])
+        overdue_tasks = self.repository.overdue_task_count(item["id"], utc_now())
         result["priority"] = priority_score(
-            item["severity"], item["quantity"], item["threshold"])
+            item["severity"], item["quantity"], item["threshold"],
+            open_records + open_tasks, overdue_tasks)
         result["deadline_hours"] = response_deadline_hours(
             item["severity"], item["quantity"], item["threshold"])
         result["escalation_required"] = escalation_required(
             item["severity"], item["quantity"], item["threshold"])
+        result["open_records"] = open_records
+        result["open_tasks"] = open_tasks
+        result["overdue_tasks"] = overdue_tasks
+        result["has_overdue_tasks"] = overdue_tasks > 0
         return result
